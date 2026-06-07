@@ -1,0 +1,274 @@
+import os, re, json, math, sys, datetime
+from urllib.parse import urlencode
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+
+BASE = 'https://jgsa.nregsmp.org'
+BLOCKS = ['AMARPATAN','MAIHAR','MAJHGAWAN','NAGOD','RAMNAGAR','RAMPUR BAGHELAN','SATNA','UNCHAHARA']
+DATE = os.environ.get('JGSA_DATE') or datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30))).strftime('%Y-%m-%d')
+DISTRICT = 'SATNA'
+OUT = os.environ.get('JGSA_OUT', 'jgsa_live_data.js')
+ENG = os.environ.get('ENGNAME_FILE', 'engname.xlsx')
+SESSION = requests.Session()
+SESSION.headers.update({'User-Agent':'Mozilla/5.0 JGSA-Satna-Dashboard/3.0'})
+
+def norm(s):
+    return re.sub(r'\s+', ' ', str(s or '').strip()).upper()
+
+def num(x):
+    if x is None: return 0.0
+    s = str(x)
+    # remove commas, rupee, percent and Hindi/English words, keep signs/dots
+    s = s.replace(',', '')
+    m = re.findall(r'-?\d+(?:\.\d+)?', s)
+    if not m: return 0.0
+    try: return float(m[-1])
+    except: return 0.0
+
+def get_html(url):
+    r = SESSION.get(url, timeout=40)
+    r.raise_for_status()
+    return r.text
+
+def read_tables(html):
+    try:
+        return pd.read_html(html)
+    except Exception:
+        return []
+
+def clean_df(df):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(how='all')
+    for c in df.columns:
+        df[c] = df[c].astype(str).replace({'nan':''})
+    return df
+
+def choose_table(tables, min_rows=1):
+    if not tables: return pd.DataFrame()
+    tables = [clean_df(t) for t in tables]
+    tables = [t for t in tables if len(t) >= min_rows]
+    if not tables: return pd.DataFrame()
+    return max(tables, key=lambda d: len(d) * max(1, len(d.columns)))
+
+def find_col(cols, keywords):
+    for c in cols:
+        nc = norm(c)
+        for k in keywords:
+            if norm(k) in nc:
+                return c
+    return None
+
+def parse_work_rows(df, block):
+    rows=[]
+    if df.empty: return rows
+    cols=list(df.columns)
+    col_block=find_col(cols,['block','janpad','जनपद'])
+    col_gp=find_col(cols,['panchayat','gram panchayat','ग्राम पंचायत','gp'])
+    col_code=find_col(cols,['work code','कार्य कोड','code'])
+    col_name=find_col(cols,['work name','कार्य नाम','name'])
+    col_type=find_col(cols,['work type','category','श्रेणी','type'])
+    col_status=find_col(cols,['status','स्थिति'])
+    col_sanc=find_col(cols,['sanction','स्वीकृत','sanctioned','estimated'])
+    col_book=find_col(cols,['booked','expenditure','व्यय','खर्च','exp'])
+    col_pct=find_col(cols,['%', 'percent','प्रतिशत'])
+    for _,r in df.iterrows():
+        text = ' '.join(str(v) for v in r.values)
+        if not text.strip(): continue
+        # Skip obvious header-like rows
+        if 'work code' in text.lower() and 'panchayat' in text.lower(): continue
+        status = str(r.get(col_status,'')) if col_status else ''
+        w = {
+            'block': str(r.get(col_block, block)).strip() if col_block else block,
+            'panchayat': str(r.get(col_gp,'')).strip() if col_gp else '',
+            'workCode': str(r.get(col_code,'')).strip() if col_code else '',
+            'workName': str(r.get(col_name,'')).strip() if col_name else text[:140],
+            'workType': str(r.get(col_type,'Uncategorised')).strip() if col_type else 'Uncategorised',
+            'status': status,
+            'sanctionAmount': num(r.get(col_sanc,0)) if col_sanc else 0,
+            'bookedAmount': num(r.get(col_book,0)) if col_book else 0,
+            'expPercent': num(r.get(col_pct,0)) if col_pct else 0,
+            'needsVerification': bool(re.search(r'Needs\s*Verification|Verification\s*Needed|सत्यापन', text, re.I)),
+            'rawText': re.sub(r'\s+', ' ', text).strip()[:600]
+        }
+        # If booked % not explicit, calculate where possible
+        if not w['expPercent'] and w['sanctionAmount']:
+            w['expPercent'] = round((w['bookedAmount']/w['sanctionAmount'])*100,2)
+        rows.append(w)
+    return rows
+
+def load_eng_map(path):
+    mapping={}
+    if not os.path.exists(path): return mapping
+    try:
+        df=pd.read_excel(path, header=None)
+    except Exception as e:
+        print('engname read failed', e, file=sys.stderr); return mapping
+    # detect header row containing जनपद and ग्राम पंचायत
+    header_idx=0
+    for i in range(min(20,len(df))):
+        row=' '.join(str(x) for x in df.iloc[i].tolist())
+        if ('जनपद' in row or 'JANPAD' in row.upper()) and ('ग्राम' in row or 'PANCHAYAT' in row.upper()):
+            header_idx=i; break
+    data=df.iloc[header_idx+1:].copy()
+    # Known structure: क्रमांक, जनपद, क्लस्टर, ग्राम पंचायत, उपयंत्री
+    for _,r in data.iterrows():
+        vals=[str(x).strip() for x in r.tolist()]
+        if len(vals)<5: continue
+        block, gp, eng = vals[1], vals[3], vals[4]
+        if not block or block.lower()=='nan' or not gp or gp.lower()=='nan' or not eng or eng.lower()=='nan': continue
+        mapping[(norm(block), norm(gp))] = eng.strip()
+    return mapping
+
+def status_flags(status, text=''):
+    s=norm(str(status)+' '+str(text))
+    complete = any(k in s for k in ['COMPLETE','COMPLETED','CC','पूर्ण'])
+    physical = any(k in s for k in ['PHYSICAL','PHYSICALLY','PHYCS','भौतिक'])
+    ongoing = any(k in s for k in ['ONGOING','प्रगतिरत','IN PROGRESS']) or (not complete and not physical)
+    return complete, physical, ongoing
+
+def grade(score):
+    if score >= 8: return 'A'
+    if score >= 6: return 'B'
+    if score >= 4: return 'C'
+    return 'D'
+
+def grade_text(g):
+    return {'A':'अच्छा Performance','B':'Progressing','C':'Progress Needed','D':'Critical / Poor Performance'}.get(g,'')
+
+def calc_category_score(items):
+    started=len(items)
+    if not started: return {'score':0,'partA':0,'partB':0,'avgExpPct':0,'works':0,'completedPhy':0,'sanction':0,'booked':0}
+    comp_phy=0; sanc=0; book=0; pct_sum=0
+    for w in items:
+        c,p,o=status_flags(w.get('status',''), w.get('rawText',''))
+        if c or p: comp_phy += 1
+        sanc += w.get('sanctionAmount',0) or 0
+        book += w.get('bookedAmount',0) or 0
+        pct_sum += w.get('expPercent',0) or 0
+    partA = min(5, (comp_phy/started)*5) if started else 0
+    partB = min(5, (book/sanc)*5) if sanc else min(5, (pct_sum/started)/100*5)
+    return {'score':round(partA+partB,2), 'partA':round(partA,2), 'partB':round(partB,2), 'avgExpPct':round(pct_sum/started,2), 'works':started, 'completedPhy':comp_phy, 'sanction':round(sanc,2), 'booked':round(book,2)}
+
+def calc_engineers(works):
+    groups={}
+    for w in works:
+        eng=w.get('engineer') or 'Unmapped'
+        groups.setdefault(eng,[]).append(w)
+    out=[]
+    for eng,items in groups.items():
+        bycat={}
+        for w in items: bycat.setdefault(w.get('workType') or 'Uncategorised',[]).append(w)
+        total_sanc=sum((w.get('sanctionAmount',0) or 0) for w in items)
+        cats=[]; weighted=0
+        for cat,ci in bycat.items():
+            cs=calc_category_score(ci)
+            weight=(cs['sanction']/total_sanc) if total_sanc else (cs['works']/len(items))
+            weighted += weight*cs['score']
+            cs.update({'category':cat, 'weight':round(weight*100,2), 'grade':grade(cs['score'])})
+            cats.append(cs)
+        cats=sorted(cats, key=lambda x: x['score'], reverse=True)
+        comp=phy=ongo=needs=0; pct_sum=0; booked=0
+        for w in items:
+            c,p,o=status_flags(w.get('status',''), w.get('rawText',''))
+            comp+=int(c); phy+=int(p); ongo+=int(o)
+            needs+=int(w.get('needsVerification',False))
+            pct_sum += w.get('expPercent',0) or 0
+            booked += w.get('bookedAmount',0) or 0
+        sc=round(weighted,2)
+        g=grade(sc)
+        blocks=sorted(set(w.get('block','') for w in items if w.get('block')))
+        out.append({'engineer':eng, 'janpad':', '.join(blocks), 'works':len(items), 'completed':comp, 'physicalCompleted':phy, 'ongoing':ongo, 'needsVerification':needs, 'score':sc, 'grade':g, 'gradeText':grade_text(g), 'avgBookedPct':round(pct_sum/len(items),2) if items else 0, 'sanction':round(total_sanc,2), 'booked':round(booked,2), 'categories':cats})
+    out=sorted(out, key=lambda x:(-x['score'], x['needsVerification'], -x['works']))
+    for i,x in enumerate(out,1): x['rank']=i
+    return out
+
+def calc_blocks(works):
+    groups={}
+    for w in works: groups.setdefault(w.get('block','Unknown'),[]).append(w)
+    arr=[]
+    for b,items in groups.items():
+        comp=phy=ongo=needs=0; sanc=book=0
+        bycat={}
+        for w in items:
+            c,p,o=status_flags(w.get('status',''), w.get('rawText',''))
+            comp+=int(c); phy+=int(p); ongo+=int(o); needs+=int(w.get('needsVerification',False))
+            sanc += w.get('sanctionAmount',0) or 0; book += w.get('bookedAmount',0) or 0
+            bycat.setdefault(w.get('workType') or 'Uncategorised',[]).append(w)
+        cats=[]; weighted=0
+        for cat,ci in bycat.items():
+            cs=calc_category_score(ci); weight=(cs['sanction']/sanc) if sanc else (cs['works']/len(items)); weighted+=weight*cs['score']; cs.update({'category':cat,'weight':round(weight*100,2)}); cats.append(cs)
+        sc=round(weighted,2); g=grade(sc)
+        arr.append({'block':b, 'works':len(items), 'completed':comp, 'physicalCompleted':phy, 'ongoing':ongo, 'needsVerification':needs, 'sanction':round(sanc,2), 'booked':round(book,2), 'avgBookedPct':round(book/sanc*100,2) if sanc else 0, 'score':sc, 'grade':g, 'gradeText':grade_text(g), 'categories':sorted(cats,key=lambda x:x['score'], reverse=True)})
+    arr=sorted(arr,key=lambda x:-x['score'])
+    for i,x in enumerate(arr,1): x['rank']=i
+    return arr
+
+def fetch_work_monitor():
+    all_works=[]; urls={}
+    for block in BLOCKS:
+        params={'district':DISTRICT,'block':block,'panchayat':'','work_type':'','status':'','exp_pct':'','q':'','date':DATE}
+        url=BASE+'/work-monitor.php?'+urlencode(params)
+        urls[block]=url
+        print('fetch work monitor', block)
+        try:
+            html=get_html(url)
+            df=choose_table(read_tables(html), min_rows=1)
+            works=parse_work_rows(df, block)
+            # Add link and force block name
+            for w in works:
+                w['block']=block
+                w['sourceUrl']=url
+            print(' rows', len(works))
+            all_works.extend(works)
+        except Exception as e:
+            print('failed block', block, e, file=sys.stderr)
+    return all_works, urls
+
+def fetch_official_ranking():
+    url=BASE+'/rankings.php?'+urlencode({'level':'block','date':DATE,'district':DISTRICT})
+    rows=[]
+    try:
+        html=get_html(url)
+        tables=read_tables(html)
+        df=choose_table(tables, min_rows=1)
+        for _,r in df.iterrows():
+            d={str(k):str(v) for k,v in r.items()}
+            text=' '.join(d.values())
+            if re.search('AMARPATAN|MAIHAR|MAJHGAWAN|NAGOD|RAMNAGAR|RAMPUR|SATNA|UNCHAHARA', text, re.I):
+                rows.append(d)
+    except Exception as e:
+        print('official ranking failed', e, file=sys.stderr)
+    return rows, url
+
+def main():
+    engmap=load_eng_map(ENG)
+    works, work_urls=fetch_work_monitor()
+    # map engineer exact names, including अति/अति0 suffixes
+    unmapped=0
+    for w in works:
+        key=(norm(w.get('block')), norm(w.get('panchayat')))
+        eng=engmap.get(key)
+        if not eng:
+            unmapped+=1; eng='Unmapped'
+        w['engineer']=eng
+    engineerRanking=calc_engineers(works)
+    internalBlock=calc_blocks(works)
+    officialRows, rankingUrl=fetch_official_ranking()
+    total=len(works); needs=sum(1 for w in works if w.get('needsVerification'))
+    comp=phy=ongo=0; sanc=book=0
+    for w in works:
+        c,p,o=status_flags(w.get('status',''), w.get('rawText',''))
+        comp+=int(c); phy+=int(p); ongo+=int(o); sanc+=w.get('sanctionAmount',0) or 0; book+=w.get('bookedAmount',0) or 0
+    data={'generatedAt':datetime.datetime.utcnow().isoformat()+'Z','date':DATE,'district':DISTRICT,
+          'sourceUrls':{'main':BASE+'/?'+urlencode({'status':'all','district':DISTRICT,'block':'','worktype_id':'0','date':DATE}), 'officialBlockRanking':rankingUrl, 'workMonitorByBlock':work_urls},
+          'summary':{'totalWorks':total,'completed':comp,'physicalCompleted':phy,'ongoing':ongo,'needsVerification':needs,'sanction':round(sanc,2),'booked':round(book,2),'bookedPct':round(book/sanc*100,2) if sanc else 0,'engineers':len(engineerRanking),'unmappedWorks':unmapped},
+          'works':works, 'engineerRanking':engineerRanking, 'blockRankingInternal':internalBlock, 'officialBlockRankingRows':officialRows,
+          'gradeLegend':{'A':'अच्छा Performance','B':'Progressing','C':'Progress Needed','D':'Critical / Poor Performance'},
+          'notes':['Work data is fetched block-wise to avoid the 2000 row All-Janpad limit.','Engineer mapping comes only from engname.xlsx. JGSA work values come from live JGSA pages.']}
+    js='window.JGSA_LIVE_DATA = '+json.dumps(data, ensure_ascii=False, indent=2)+';\n'
+    with open(OUT,'w',encoding='utf-8') as f: f.write(js)
+    print('wrote', OUT, 'works', total, 'needs', needs, 'engineers', len(engineerRanking), 'unmapped', unmapped)
+
+if __name__=='__main__': main()
