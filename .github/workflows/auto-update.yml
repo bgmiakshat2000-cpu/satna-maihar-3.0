@@ -1,14 +1,9 @@
-name: Auto update JGSA live dashboard
+name: Auto update JGSA dashboard
 
 on:
   workflow_dispatch:
-    inputs:
-      date:
-        description: 'JGSA date YYYY-MM-DD (leave blank for today)'
-        required: false
-        default: ''
   schedule:
-    - cron: '30 2 * * *'
+    - cron: '30 4 * * *'
 
 permissions:
   contents: write
@@ -17,22 +12,18 @@ jobs:
   update:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Fetch JGSA live data
-        env:
-          JGSA_DATE: ${{ github.event.inputs.date }}
-          ENGNAME_FILE: engname.xlsx
-          JGSA_OUT: jgsa_live_data.js
+      - name: Fetch live JGSA data
         run: python scripts/fetch_live_jgsa.py
       - name: Commit updated data
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: Auto update JGSA live data
-          file_pattern: jgsa_live_data.js
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add jgsa_live_data.js
+          git diff --cached --quiet && echo "No changes" || git commit -m "Auto update JGSA live data"
+          git push
