@@ -1,17 +1,13 @@
-# JGSA Satna + Maihar Live Dashboard v3
+# JGSA Satna + Maihar Live Dashboard v3 — Offline Preview Ready
 
-This dashboard is built without Excel work data. It uses:
+Open `index.html` directly to preview the dashboard with preloaded data.
 
-- JGSA main dashboard link
-- 8 Janpad-wise Work Monitor links, to avoid the 2000-row All-Janpad limit
-- Official JGSA Block Ranking link
-- `engname.xlsx` only for Janpad + Gram Panchayat → Engineer mapping
+For GitHub upload, upload all files and folders. GitHub Actions will refresh `jgsa_live_data.js` from JGSA sources in future runs.
 
-## GitHub upload
-Upload all extracted files to the repo root.
+Sources configured:
+- Main JGSA overview
+- 8 Janpad-wise Work Monitor links
+- Official Block Ranking link
+- engname.xlsx only for engineer mapping
 
-## Auto update
-Go to Actions → Auto update JGSA live dashboard → Run workflow.
-
-## Custom domain
-CNAME is set to `srdmsatna.online`. Remove or edit the CNAME file if using another domain.
+Note: The included data is preloaded for offline preview. Live GitHub Action refresh will replace it with fresh JGSA data.

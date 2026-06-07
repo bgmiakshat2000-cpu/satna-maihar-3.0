@@ -6,6 +6,16 @@ from bs4 import BeautifulSoup
 
 BASE = 'https://jgsa.nregsmp.org'
 BLOCKS = ['AMARPATAN','MAIHAR','MAJHGAWAN','NAGOD','RAMNAGAR','RAMPUR BAGHELAN','SATNA','UNCHAHARA']
+DISTRICT_GROUPS = {
+    'Satna': {'MAJHGAWAN','NAGOD','RAMPUR BAGHELAN','SATNA','UNCHAHARA'},
+    'Maihar': {'AMARPATAN','RAMNAGAR','MAIHAR'}
+}
+def district_for_block(block):
+    b = norm(block)
+    for d, arr in DISTRICT_GROUPS.items():
+        if b in arr:
+            return d
+    return 'Satna'
 DATE = os.environ.get('JGSA_DATE') or datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30))).strftime('%Y-%m-%d')
 DISTRICT = 'SATNA'
 OUT = os.environ.get('JGSA_OUT', 'jgsa_live_data.js')
@@ -26,6 +36,22 @@ def num(x):
     try: return float(m[-1])
     except: return 0.0
 
+
+
+def extract_fin_year_from_text(text):
+    t = str(text or '')
+    # JGSA Work Monitor shows FIN. YEAR like 2025-2026 / 2024-2025.
+    # Restrict to normal FY ranges so long work-code IDs do not become fake years.
+    m = re.search(r'(20(?:1[5-9]|2[0-6]))\s*[-–]\s*(20(?:1[6-9]|2[0-7]))', t)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    # Fallback only when an explicit campaign/work name year is visible, not from work-code numbers.
+    m = re.search(r'(?:JGSA|JGS|जल\s*गंगा|अभियान)\D*(20(?:1[5-9]|2[0-6]))', t, re.I)
+    if m:
+        y = int(m.group(1))
+        return f"{y-1}-{y}"
+    return ''
+
 def get_html(url):
     r = SESSION.get(url, timeout=40)
     r.raise_for_status()
@@ -33,13 +59,20 @@ def get_html(url):
 
 def read_tables(html):
     try:
-        return pd.read_html(html)
+        # displayed_only=False helps if FIN. YEAR is in a horizontally scrollable/hidden table column.
+        return pd.read_html(html, displayed_only=False)
     except Exception:
-        return []
+        try:
+            return pd.read_html(html)
+        except Exception:
+            return []
 
 def clean_df(df):
     df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    if hasattr(df.columns, 'to_flat_index'):
+        df.columns = [' '.join([str(x) for x in tup if str(x) != 'nan']).strip() if isinstance(tup, tuple) else str(tup).strip() for tup in df.columns.to_flat_index()]
+    else:
+        df.columns = [str(c).strip() for c in df.columns]
     df = df.dropna(how='all')
     for c in df.columns:
         df[c] = df[c].astype(str).replace({'nan':''})
@@ -70,6 +103,7 @@ def parse_work_rows(df, block):
     col_name=find_col(cols,['work name','कार्य नाम','name'])
     col_type=find_col(cols,['work type','category','श्रेणी','type'])
     col_status=find_col(cols,['status','स्थिति'])
+    col_year=find_col(cols,['fin. year','fin year','financial year','year','वित्तीय वर्ष','वर्ष'])
     col_sanc=find_col(cols,['sanction','स्वीकृत','sanctioned','estimated'])
     col_book=find_col(cols,['booked','expenditure','व्यय','खर्च','exp'])
     col_pct=find_col(cols,['%', 'percent','प्रतिशत'])
@@ -86,6 +120,7 @@ def parse_work_rows(df, block):
             'workName': str(r.get(col_name,'')).strip() if col_name else text[:140],
             'workType': str(r.get(col_type,'Uncategorised')).strip() if col_type else 'Uncategorised',
             'status': status,
+            'finYear': (str(r.get(col_year,'')).strip() if col_year else '') or extract_fin_year_from_text(text),
             'sanctionAmount': num(r.get(col_sanc,0)) if col_sanc else 0,
             'bookedAmount': num(r.get(col_book,0)) if col_book else 0,
             'expPercent': num(r.get(col_pct,0)) if col_pct else 0,
@@ -122,10 +157,12 @@ def load_eng_map(path):
     return mapping
 
 def status_flags(status, text=''):
-    s=norm(str(status)+' '+str(text))
-    complete = any(k in s for k in ['COMPLETE','COMPLETED','CC','पूर्ण'])
+    # Statuses are exclusive on Work Monitor: Completed, Physically Completed, or Ongoing.
+    # Do not let "Physically Completed" count as both Completed and Physical.
+    s=norm(str(status))
     physical = any(k in s for k in ['PHYSICAL','PHYSICALLY','PHYCS','भौतिक'])
-    ongoing = any(k in s for k in ['ONGOING','प्रगतिरत','IN PROGRESS']) or (not complete and not physical)
+    complete = (not physical) and any(k in s for k in ['COMPLETE','COMPLETED','पूर्ण'])
+    ongoing = any(k in s for k in ['ONGOING','प्रगतिरत','IN PROGRESS','चालू']) or (not complete and not physical)
     return complete, physical, ongoing
 
 def grade(score):
@@ -219,6 +256,7 @@ def fetch_work_monitor():
             # Add link and force block name
             for w in works:
                 w['block']=block
+                w['district']=district_for_block(block)
                 w['sourceUrl']=url
             print(' rows', len(works))
             all_works.extend(works)
@@ -227,20 +265,41 @@ def fetch_work_monitor():
     return all_works, urls
 
 def fetch_official_ranking():
+    """Fetch official JGSA block ranking from rankings.php.
+    This source must remain separate from Work Monitor internal calculations.
+    """
     url=BASE+'/rankings.php?'+urlencode({'level':'block','date':DATE,'district':DISTRICT})
     rows=[]
     try:
         html=get_html(url)
+        soup=BeautifulSoup(html, 'html.parser')
         tables=read_tables(html)
-        df=choose_table(tables, min_rows=1)
-        for _,r in df.iterrows():
-            d={str(k):str(v) for k,v in r.items()}
-            text=' '.join(d.values())
-            if re.search('AMARPATAN|MAIHAR|MAJHGAWAN|NAGOD|RAMNAGAR|RAMPUR|SATNA|UNCHAHARA', text, re.I):
+        candidates=[]
+        for df in tables:
+            df=clean_df(df)
+            text=' '.join([str(c) for c in df.columns])+' '+(' '.join(df.astype(str).values.flatten()[:200]))
+            if re.search(r'MAJHGAWAN|NAGOD|AMARPATAN|UNCHAHARA|RAMNAGAR', text, re.I):
+                candidates.append(df)
+        if candidates:
+            df=max(candidates, key=lambda d: len(d.columns))
+            # Flatten multi-index-ish names and normalize common labels.
+            df.columns=[re.sub(r'\s+',' ',str(c)).strip() for c in df.columns]
+            for _,r in df.iterrows():
+                rowtxt=' '.join(str(v) for v in r.values)
+                if not re.search(r'MAJHGAWAN|NAGOD|AMARPATAN|UNCHAHARA|RAMNAGAR|RAMPUR|SATNA|MAIHAR', rowtxt, re.I):
+                    continue
+                d={str(k):str(v) for k,v in r.items()}
                 rows.append(d)
     except Exception as e:
         print('official ranking failed', e, file=sys.stderr)
     return rows, url
+
+
+def validate_before_write(data):
+    total = len(data.get('works', []))
+    if total < 5000:
+        raise RuntimeError(f'Fetched only {total} works; refusing to overwrite dashboard data. Check Work Monitor parsing/portal availability.')
+    return True
 
 def main():
     engmap=load_eng_map(ENG)
@@ -267,6 +326,7 @@ def main():
           'works':works, 'engineerRanking':engineerRanking, 'blockRankingInternal':internalBlock, 'officialBlockRankingRows':officialRows,
           'gradeLegend':{'A':'अच्छा Performance','B':'Progressing','C':'Progress Needed','D':'Critical / Poor Performance'},
           'notes':['Work data is fetched block-wise to avoid the 2000 row All-Janpad limit.','Engineer mapping comes only from engname.xlsx. JGSA work values come from live JGSA pages.']}
+    validate_before_write(data)
     js='window.JGSA_LIVE_DATA = '+json.dumps(data, ensure_ascii=False, indent=2)+';\n'
     with open(OUT,'w',encoding='utf-8') as f: f.write(js)
     print('wrote', OUT, 'works', total, 'needs', needs, 'engineers', len(engineerRanking), 'unmapped', unmapped)
